@@ -1,0 +1,1154 @@
+﻿End-to-End Stochastic Optimization with
+Energy-Based Model
+Lingkai Kong
+Jiaming Cui
+Yuchen Zhuang
+Rui Feng
+B. Aditya Prakash
+Chao Zhang
+College of Computing
+Georgia Institute of Technology
+{lkkong,jiamingcui1997,yczhuang,rfeng,badityap,chaozhang}@gatech.edu
+Abstract
+Decision-focused learning (DFL) was recently proposed for stochastic optimization
+problems that involve unknown parameters. By integrating predictive modeling
+with an implicitly differentiable optimization layer, DFL has shown superior per-
+formance to the standard two-stage predict-then-optimize pipeline. However, most
+existing DFL methods are only applicable to convex problems or a subset of non-
+convex problems that can be easily relaxed to convex ones. Further, they can be
+inefficient in training due to the requirement of solving and differentiating through
+the optimization problem in every training iteration. We propose SO-EBM, a
+general and efficient DFL method for stochastic optimization using energy-based
+models. Instead of relying on KKT conditions to induce an implicit optimization
+layer, SO-EBM explicitly parameterizes the original optimization problem using a
+differentiable optimization layer based on energy functions. To better approximate
+the optimization landscape, we propose a coupled training objective that uses a
+maximum likelihood loss to capture the optimum location and a distribution-based
+regularizer to capture the overall energy landscape. Finally, we propose an efficient
+training procedure for SO-EBM with a self-normalized importance sampler based
+on a Gaussian mixture proposal. We evaluate SO-EBM in three applications: power
+scheduling, COVID-19 resource allocation, and non-convex adversarial security
+game, demonstrating the effectiveness and efficiency of SO-EBM.
+1
+Introduction
+Many real-life decision making tasks are stochastic optimization problems, where one needs to
+make decisions to minimize a cost function that involves stochastic parameters. Oftentimes, the
+involved stochastic parameters are unknown and context-dependent, meaning that they need to be
+predicted from observed features. For example, when allocating clinical resources for COVID-19, it
+is necessary to consider future cases in different regions, whose distributions are unknown and have to
+be predicted from the current state. As two other examples, hedge funds need to continuously adjust
+their portfolio for maximal expected return, by forecasting future return rates of different stocks; and
+in supply chain optimization, facility locations need to be decided to minimize long-term operational
+costs, by accounting for unknown and uncertain regional supplies and customer demands.
+With the feasibility of training powerful deep learning predictors from large amounts of data, it is
+increasingly common to solve such stochastic optimization problems using a two-stage predict-then-
+optimize pipeline. In the prediction stage, one learns a predictive model for the unknown parameters
+using certain prediction loss (e.g., negative likelihood). In the optimization stage, the predicted
+distributions of the parameters are used to parameterize the stochastic optimization problem, which
+can be then solved using off-the-shelf solvers [21, 2, 12]. This two-stage pipeline relies on an implicit
+36th Conference on Neural Information Processing Systems (NeurIPS 2022).
+and commonly-accepted assumption: improvements in parameter prediction in terms of the prediction
+loss will always translate to better optimization outcomes. However, this is not the case: machine
+learning models make errors and the impact of prediction errors is not uniform w.r.t. the optimization
+loss. Thus, a smaller predictive loss does not necessarily lead to a smaller decision regret.
+A better approach is decision-focused learning (DFL) [13, 1, 4], which integrates prediction and
+optimization layers into a unified model to learn them end-to-end. Most DFL methods implement
+the optimization procedure as an implicitly differentiable layer and develop techniques (e.g., using
+KKT conditions) to compute the gradients w.r.t. the decision variables and enable back-propagating
+through it. Compared to the two-stage pipeline, the prediction layer so learned is tailored for the
+optimization problem and better in the sense that it can yield decisions with smaller regrets. Besides
+DFL, there are also approaches where a policy network is trained to directly map from the input to
+the solution of the optimization problem using supervised or reinforcement learning [47, 26, 34].
+However, their performance are often inferior to DFL as they ignore the algorithmic structure of the
+problem and typically require a large amount of data to rediscover the algorithmic structure.
+Despite their promising results, existing DFL methods [13, 4, 1, 41, 48] suffer from two drawbacks.
+(1) Generality. To leverage the KKT condition, they are mostly applicable to only convex optimization
+objectives [13, 4, 1]. Though a few works approximate nonconvex objectives by quadratic functions
+[41, 48], their applicability is still limited to easy-to-relax nonconvex problems and can suffer from
+poor gradient estimates caused by the relaxation. (2) Scalability. Due to the reliance of using the
+KKT condition to compute derivatives, they require repeatedly solving the optimization program and
+back-propagating through it during training, which makes them unscalable. The problem is more
+severe when the expectation of the cost cannot be computed analytically.
+We propose a new end-to-end stochastic optimization method using an energy-based model (EBM),
+named SO-EBM. Similar to DFL, SO-EBM models the algorithmic predict-and-optimize structure by
+stacking a differentiable optimization layer on top of a neural predictor. Different from DFL, SO-
+EBM eliminates the need of using KKT conditions to induce an implicit differentiable optimization
+layer. Instead, it leverages expressive EBMs [33] to directly model the conditional probability of
+the decisions and parameterizes an explicit energy-based differentiable layer as a surrogate to the
+original optimization problem. To better approximate the optimization landscape with the EBM
+surrogate, we design two complementary learning objectives in SO-EBM: 1) a local matching
+objective that maximizes the likelihood of the optimal decisions; and 2) a global matching objective
+that minimizes the distribution distance between the posterior distribution of the decision variables
+and the surrogate-based decision distribution.
+Due to its flexibility, SO-EBM is not constrained to convex objectives, but can be applied to a wide
+class of stochastic optimization problems. Another key advantage of SO-EBM is its computational
+efficiency. As the optimization layer is parameterized by an energy-based model, SO-EBM eliminates
+the need of solving and differentiating through the optimization procedure at each training iteration.
+Rather, SO-EBM estimates the derivatives of the energy-based surrogate model using a self-normalized
+importance sampler. We design a Gaussian-mixture proposal distribution for the sampler, which
+not only reduces sampling variance, but also borrows the idea of contrastive divergence for MCMC
+methods to speed up the training of SO-EBM.
+The main contributions of this work are: (1) We propose a new end-to-end stochastic optimization
+method based on energy-based model. It avoids the needs of solving and differentiating through the
+optimization problem during training and can be applied to a wide range of stochastic optimization
+problems beyond convex objectives. (2) We propose a coupled training objective to encourage
+the energy-based surrogate to well approximate the optimization landscape and an efficient self-
+normalized importance sampler based on a mixture-of-Gaussian proposal. (3) Experiments on power
+scheduling, COVID-19 resource allocation and adversarial network security game show that our
+method can achieve better or comparable performance than existing DFL methods while being much
+more efficient.
+2
+Preliminaries
+Problem Formulation. Consider a stochastic optimization problem:
+arg mina∈C f(y, a),
+2
+Predictive Distribution
+p(y|x; ✓)
+<latexit sha1_base64="Zs7yBxASZ3
+SzJgCPrhSE84xQpM=">AB/3icbVDLSsNAFJ34rPUVFdy4CRahbkpSCwpuCm5cVr
+APaEqZTCft0MkzNyIe3CX3HjQhG3/oY7/8ZJm4W2Hhg4nHMv98zxIs4U2Pa3sb
+K6tr6xWdgqbu/s7u2bB4ctFcaS0CYJeSg7HlaUM0GbwIDTiQpDjxO2974JvPbD1Q
+qFop7SCLaC/BQMJ8RDFrqm8dROZm4AYaR56eP02sXRhTwed8s2RV7BmuZODkpoRyN
+vnlDkISB1QA4ViprmNH0EuxBEY4nRbdWNEIkzEe0q6mAgdU9dJZ/ql1pWB5YdSP
+wHWTP29keJAqSTw9GSWVC16mfif143Bv+qlTEQxUEHmh/yYWxBaWRnWgElKgCeaYC
+KZzmqREZaYgK6sqEtwFr+8TFrVinNRqd7VSvVaXkcBnaBTVEYOukR1dIsaqIkImq
+Bn9IrejCfjxXg3PuajK0a+c4T+wPj8AR+hlh4=</latexit>p(y|x; ✓)
+<latexit sha1_base64="Zs7yBxASZ3
+SzJgCPrhSE84xQpM=">AB/3icbVDLSsNAFJ34rPUVFdy4CRahbkpSCwpuCm5cVr
+APaEqZTCft0MkzNyIe3CX3HjQhG3/oY7/8ZJm4W2Hhg4nHMv98zxIs4U2Pa3sb
+K6tr6xWdgqbu/s7u2bB4ctFcaS0CYJeSg7HlaUM0GbwIDTiQpDjxO2974JvPbD1Q
+qFop7SCLaC/BQMJ8RDFrqm8dROZm4AYaR56eP02sXRhTwed8s2RV7BmuZODkpoRyN
+vnlDkISB1QA4ViprmNH0EuxBEY4nRbdWNEIkzEe0q6mAgdU9dJZ/ql1pWB5YdSP
+wHWTP29keJAqSTw9GSWVC16mfif143Bv+qlTEQxUEHmh/yYWxBaWRnWgElKgCeaYC
+Bn9IrejCfjxXg3PuajK0a+c4T+wPj8AR+hlh4=</latexit>KZzmqREZaYgK6sqEtwFr+8TFrVinNRqd7VSvVaXkcBnaBTVEYOukR1dIsaqIkImq
+ 
+Features
+x
+<latexit sha1_bas
+e64="6RinIwRhmF3nAI41C90eS7cIuzk
+=">AB8XicbVDLSgMxFL3js9ZX1aWbY
+BFclZla0GXBjcsK9oFtKZk04ZmMkNyRy
+xD/8KNC0Xc+jfu/Bsz7Sy09UDgcM695N
+zjx1IYdN1vZ219Y3Nru7BT3N3bPzgsHR2
+3TJRoxpskpHu+NRwKRvokDJO7HmNPQ
+lb/uTm8xvP3JtRKTucRrzfkhHSgSCUbT
+SQy+kOPaD9Gk2KJXdijsHWSVeTsqQozEo
+fWGEUtCrpBJakzXc2Psp1SjYJLPir3E
+8JiyCR3xrqWKhtz03niGTm3ypAEkbZPI
+ZmrvzdSGhozDX07mSU0y14m/ud1Ewyu+
+6lQcYJcscVHQSIJRiQ7nwyF5gzl1BLKt
+LBZCRtTRnakoq2BG/5FXSqla8y0r1rl
+au1/I6CnAKZ3ABHlxBHW6hAU1goOAZXu
+HNMc6L8+58LEbXnHznBP7A+fwB+lGREg=
+=</latexit>x
+<latexit sha1_bas
+e64="6RinIwRhmF3nAI41C90eS7cIuzk
+=">AB8XicbVDLSgMxFL3js9ZX1aWbY
+BFclZla0GXBjcsK9oFtKZk04ZmMkNyRy
+xD/8KNC0Xc+jfu/Bsz7Sy09UDgcM695N
+zjx1IYdN1vZ219Y3Nru7BT3N3bPzgsHR2
+3TJRoxpskpHu+NRwKRvokDJO7HmNPQ
+lb/uTm8xvP3JtRKTucRrzfkhHSgSCUbT
+SQy+kOPaD9Gk2KJXdijsHWSVeTsqQozEo
+fWGEUtCrpBJakzXc2Psp1SjYJLPir3E
+8JiyCR3xrqWKhtz03niGTm3ypAEkbZPI
+ZmrvzdSGhozDX07mSU0y14m/ud1Ewyu+
+6lQcYJcscVHQSIJRiQ7nwyF5gzl1BLKt
+LBZCRtTRnakoq2BG/5FXSqla8y0r1rl
+au1/I6CnAKZ3ABHlxBHW6hAU1goOAZXu
+HNMc6L8+58LEbXnHznBP7A+fwB+lGREg=
+=</latexit>
+Backpropagation
+Backpropagation
+Predictive Distribution
+p(y|x; ✓)
+<latexit sha1_base64="Zs7yBxASZ3
+SzJgCPrhSE84xQpM=">AB/3icbVDLSsNAFJ34rPUVFdy4CRahbkpSCwpuCm5cVr
+APaEqZTCft0MkzNyIe3CX3HjQhG3/oY7/8ZJm4W2Hhg4nHMv98zxIs4U2Pa3sb
+K6tr6xWdgqbu/s7u2bB4ctFcaS0CYJeSg7HlaUM0GbwIDTiQpDjxO2974JvPbD1Q
+qFop7SCLaC/BQMJ8RDFrqm8dROZm4AYaR56eP02sXRhTwed8s2RV7BmuZODkpoRyN
+vnlDkISB1QA4ViprmNH0EuxBEY4nRbdWNEIkzEe0q6mAgdU9dJZ/ql1pWB5YdSP
+wHWTP29keJAqSTw9GSWVC16mfif143Bv+qlTEQxUEHmh/yYWxBaWRnWgElKgCeaYC
+KZzmqREZaYgK6sqEtwFr+8TFrVinNRqd7VSvVaXkcBnaBTVEYOukR1dIsaqIkImq
+Bn9IrejCfjxXg3PuajK0a+c4T+wPj8AR+hlh4=</latexit>p(y|x; ✓)
+<latexit sha1_base64="Zs7yBxASZ3
+SzJgCPrhSE84xQpM=">AB/3icbVDLSsNAFJ34rPUVFdy4CRahbkpSCwpuCm5cVr
+APaEqZTCft0MkzNyIe3CX3HjQhG3/oY7/8ZJm4W2Hhg4nHMv98zxIs4U2Pa3sb
+K6tr6xWdgqbu/s7u2bB4ctFcaS0CYJeSg7HlaUM0GbwIDTiQpDjxO2974JvPbD1Q
+qFop7SCLaC/BQMJ8RDFrqm8dROZm4AYaR56eP02sXRhTwed8s2RV7BmuZODkpoRyN
+vnlDkISB1QA4ViprmNH0EuxBEY4nRbdWNEIkzEe0q6mAgdU9dJZ/ql1pWB5YdSP
+wHWTP29keJAqSTw9GSWVC16mfif143Bv+qlTEQxUEHmh/yYWxBaWRnWgElKgCeaYC
+Bn9IrejCfjxXg3PuajK0a+c4T+wPj8AR+hlh4=</latexit>KZzmqREZaYgK6sqEtwFr+8TFrVinNRqd7VSvVaXkcBnaBTVEYOukR1dIsaqIkImq
+ 
+Features
+x
+<latexit sha1_bas
+e64="6RinIwRhmF3nAI41C90eS7cIuzk
+=">AB8XicbVDLSgMxFL3js9ZX1aWbY
+BFclZla0GXBjcsK9oFtKZk04ZmMkNyRy
+xD/8KNC0Xc+jfu/Bsz7Sy09UDgcM695N
+zjx1IYdN1vZ219Y3Nru7BT3N3bPzgsHR2
+3TJRoxpskpHu+NRwKRvokDJO7HmNPQ
+lb/uTm8xvP3JtRKTucRrzfkhHSgSCUbT
+SQy+kOPaD9Gk2KJXdijsHWSVeTsqQozEo
+fWGEUtCrpBJakzXc2Psp1SjYJLPir3E
+8JiyCR3xrqWKhtz03niGTm3ypAEkbZPI
+ZmrvzdSGhozDX07mSU0y14m/ud1Ewyu+
+6lQcYJcscVHQSIJRiQ7nwyF5gzl1BLKt
+LBZCRtTRnakoq2BG/5FXSqla8y0r1rl
+au1/I6CnAKZ3ABHlxBHW6hAU1goOAZXu
+HNMc6L8+58LEbXnHznBP7A+fwB+lGREg=
+=</latexit>x
+<latexit sha1_bas
+e64="6RinIwRhmF3nAI41C90eS7cIuzk
+=">AB8XicbVDLSgMxFL3js9ZX1aWbY
+BFclZla0GXBjcsK9oFtKZk04ZmMkNyRy
+xD/8KNC0Xc+jfu/Bsz7Sy09UDgcM695N
+zjx1IYdN1vZ219Y3Nru7BT3N3bPzgsHR2
+3TJRoxpskpHu+NRwKRvokDJO7HmNPQ
+lb/uTm8xvP3JtRKTucRrzfkhHSgSCUbT
+SQy+kOPaD9Gk2KJXdijsHWSVeTsqQozEo
+fWGEUtCrpBJakzXc2Psp1SjYJLPir3E
+8JiyCR3xrqWKhtz03niGTm3ypAEkbZPI
+ZmrvzdSGhozDX07mSU0y14m/ud1Ewyu+
+6lQcYJcscVHQSIJRiQ7nwyF5gzl1BLKt
+LBZCRtTRnakoq2BG/5FXSqla8y0r1rl
+au1/I6CnAKZ3ABHlxBHW6hAU1goOAZXu
+HNMc6L8+58LEbXnHznBP7A+fwB+lGREg=
+=</latexit>
+Generic Loss
+e.g., NLL
+Backpropagation
+Two-stage learning:
+Decision-focused learning:
+Stochastic Program
+a⇤ = argmina2CEp(y|x;✓)f(y, a)
+<latexit sha1_base64="DKIkcTeacavOmbmglmUDOVf/0fM=">ACLnicbVBNS
+xBEO0xo9N1E08emlcAmuQZUaFBEJAEMGjgqvCzmap6a3ZbanZ+iuCQ6T+UW5K/EQyCKePVn2Ptx8OtBw+tXVdSrF2VKWvL9/97cm/m3C4tLy7V371dW1+ofPp7ZNDc
+C2yJVqbmIwKSGtskSeFZhCSOF5NDoY189/orEy1adUZNhNYKBlLAWQk3r1Q/hRfq6+h4SXVIZJFJXvRJCqflBFSZAwygqD52UNYtf039cXlbfQhoiwVYVN4t2OrV
+G37Ln4C/JMGMNgMx736VdhPRZ6gJqHA2k7gZ9R1BkgKhVUtzC1mIEYwI6jGhK03XJybsU/OaXP49S4p4lP1McTJSTWFknkOseG7fPaWHyt1skp/totpc5yQi2mi+JcU
+r5ODvelwYFqcIREY6r1wMwYAgl3DNhRA8P/klOdtpBbutnZO9xv7eLI4ltsE2WZMF7AvbZ0fsmLWZYL/ZX3bNbrw/3j/v1rubts5s5l19gTe/QO32aoS</latexit>
+Stochastic Program
+a⇤ = argmina2CEp(y|x;✓)f(y, a)
+<latexit sha1_base64="DKIkcTeacavOmbmglmUDOVf/0fM=">ACLnicbVBNS
+xBEO0xo9N1E08emlcAmuQZUaFBEJAEMGjgqvCzmap6a3ZbanZ+iuCQ6T+UW5K/EQyCKePVn2Ptx8OtBw+tXVdSrF2VKWvL9/97cm/m3C4tLy7V371dW1+ofPp7ZNDc
+C2yJVqbmIwKSGtskSeFZhCSOF5NDoY189/orEy1adUZNhNYKBlLAWQk3r1Q/hRfq6+h4SXVIZJFJXvRJCqflBFSZAwygqD52UNYtf039cXlbfQhoiwVYVN4t2OrV
+G37Ln4C/JMGMNgMx736VdhPRZ6gJqHA2k7gZ9R1BkgKhVUtzC1mIEYwI6jGhK03XJybsU/OaXP49S4p4lP1McTJSTWFknkOseG7fPaWHyt1skp/totpc5yQi2mi+JcU
+r5ODvelwYFqcIREY6r1wMwYAgl3DNhRA8P/klOdtpBbutnZO9xv7eLI4ltsE2WZMF7AvbZ0fsmLWZYL/ZX3bNbrw/3j/v1rubts5s5l19gTe/QO32aoS</latexit>
+Optimization Loss
+l = E(x,y)⇠Df(y, a⇤(x; ✓))
+<latexit sha1_base64="iJYbQCyeBsFDdhMsGpMcFNfNgc4=">ACMnicbVDJS
+gNBEO1xjXGLevQyGIREJMyoCBCQAW9KRgVMjHUdHpMY89Cd404NPNXvwSwYMeFPHqR9hZDm4PGl6/V0VPT8RXKHjPFsjo2PjE5OFqeL0zOzcfGlh8VzFqaSsQWMRy0s
+fFBM8Yg3kKNhlIhmEvmAX/s1+z7+4ZVLxODrDLGtEK4jHnAKaKR26VjseSFg1/f1Yd7WlcEn0Hf5elb1FA/7AgWhD/I8qGTrcKX8m9lux52GUK12i6VnZrTh/2XuENS
+JkOctEuPXiemacgipAKUarpOgi0NEjkVLC96qWIJ0Bu4Zk1DIwiZaun+ybm9apSOHcTSvAjtvq9Q0OoVBb6prK3qvrt9cT/vGaKwU5L8yhJkUV0MChIhY2x3cvP7nDJKI
+rMEKCSm1t2gUJFE3KROC+/vkv+R8o+Zu1jZOt8r1rWEcBbJMVkiFuGSb1MkROSENQsk9eSKv5M16sF6sd+tjUDpiDXuWyA9Yn185p6tG</latexit>
+Figure 1: Two-stage learning back-propagates from a predictive loss to the model, ignoring the latter
+effect of the optimization problem. Decision-focused learning directly optimizes the task loss but
+needs to solve and back-propagate through the optimization problem at every training iteration.
+where y denotes the parameters of the optimization problem, a denotes the decision variables within
+a feasible space C, and f is the cost function to be optimized. In many applications, the parameters y
+are unknown and stochastic, which must be inferred from some correlated features x. We assume a
+dataset D = {xi, yi}N
+i=1 drawn from the joint distribution of the features and problem parameters.
+Our task is to learn a decision-making model M parameterized by θ, which takes the features x as
+input and outputs the optimal decisions a∗(x; θ). The model should be learned such that its output
+optimal decisions minimize the expected decision cost under the joint distribution of (x, y), namely:
+arg minθ E(x,y)∼Df(y, a∗(x; θ)).
+For example, in supply chain optimization, y can be regional customer demands, a can be pre-ordered
+products for each region, f measures the gap between actual customer demands and pre-ordered
+supplies, and the problem is to decide the best a to minimize the cost f. Herein, the actual customer
+demands y are usually unknown and must be predicted from features x such as customer purchase
+history and regional economy indices.
+Two-stage learning v.s. Decision Focused Learning (DFL). A common practice to the above
+stochastic optimization problem is the two-stage predict-then-optimize framework. It first learns an
+probabilistic predictive model p(y|x; θ) and then uses existing stochastic optimization solvers to ob-
+tain the optimal action that minimizes the expected cost: a∗(x; θ) = arg mina∈C Ey∼p(y|x;θ)f(y, a).
+Though the two-stage approach is simple and efficient, it can suffer from suboptimal performance
+due to the misalignment of the prediction loss and the optimization loss. In contrast, DFL integrates
+prediction and optimization into an end-to-end model, thus tailoring the predictive model for the
+optimization task, as shown in Figure 1. By directly optimizing the task loss, the gradient of the
+model parameters can be obtained with the following chain rule:
+∂f(y, a∗(x; θ))
+∂θ
+= ∂f(y, a∗(x; θ))
+∂a∗(x; θ)
+∂a∗(x; θ)
+∂y
+∂y
+∂θ .
+The key challenge here is to compute the Jacobian ∂a∗(x;θ)
+∂y
+: it is needed to apply the chain rule
+to learn the model using gradient decent methods. This is nontrivial, because a∗ is the solution of
+a stochastic optimization solver and not directly differentiable. To address this challenge, OptNet
+[13, 4] assumes quadratic optimization objectives and differentiates through the KKT conditions using
+the implicit function theorem. This way, OptNet can obtain the Jacobian by solving the optimization
+problem along with a set of linear equations in each training iteration. Several works [1, 41, 48]
+extend this technique to more general cases. For example, cvxpylayers [1] extends it to more general
+cases of convex optimization using disciplined parametrized programming (DPP) grammar.
+Although existing DFL approaches can achieve better decisions compared to two-stage learning, they
+have several drawbacks. First, they are often constrained to convex optimization objectives as they
+rely on the KKT conditions to compute derivatives. Though [41, 48] propose to approximate some
+non-convex objectives by a quadratic function around a local minimum, the inaccurate gradients
+may be aggregated during the training iterations and thus lead to poor decision quality. Second, they
+suffer from high computational complexity because the computation of the Jacobian ∂a∗(x;θ)
+∂y
+requires
+repeatedly solving the optimization program and back-propagating through it. The problem is more
+severe when the expectation of the cost cannot be computed analytically. In that case, we need to
+3
+use sample average approximation [27, 46, 30] and draw multiple IID samples from the predictive
+distribution, which makes the objective much more complicated and expensive.
+3
+Proposed Method
+3.1
+Energy-based Model for End-to-end Stochastic Programming
+Our task is to learn an optimal decision-making model Mθ, such that its output optimal decision
+a∗(x; θ) for input x minimizes the expected optimization cost: E(x,y)∼Df(y, a∗(x; θ)). The core
+idea of our method is to directly model Mθ’s probability distribution over the decisions conditioned
+on the features, denoted as q(a|x; θ), using energy-based parameterization [33]:
+q(a|x; θ) = exp(−E(x, a; θ))
+Z(x, θ)
+,
+Z(x; θ) =
+�
+exp(−E(x, a; θ)da.
+(1)
+To parameterize the energy function E(x, a; θ), a natural option is to directly use a deep neural
+network which takes a feature-decision pair (x, a) as input and output a scalar value. However, such
+a design ignores the algorithmic structure of the optimization problem and thus can be data-inefficient
+during learning. Instead, we propose to explicitly model the problem structure by using the expected
+task loss as the energy function:
+E(x, a; θ) = Ep(y|x;θ)f(y, a),
+(2)
+where p(y|x; θ) is the predictive distribution of an uncertainty-aware neural network [19, 31].
+Eq. 2 creates an explicit energy-based differentiable layer as a surrogate to the original optimization
+problem. Compared with the two-stage model, it builds a direct connection between the input features
+x and decision variable a and thus is more tailored to the downstream task. Compared with pure
+end-to-end architectures, the task-based surrogate energy function explicitly leverages the algorithmic
+structure of the optimization problem and thus saves a lot of learning. This energy-based surrogate
+function also has a intuitive interpretation. When the decision a is in a region with smaller expected
+task loss, it has lower energy and higher probability; when it leads to higher expected task loss, it has
+higher energy and lower probability.
+Since we have the ground truth for the parameters y in the training data, the feature-decision pairs
+Da = {(xi, a∗
+i )}N
+i=1 can be easily constructed by solving a∗
+i = arg minai∈C f(yi, ai) for each
+(xi, yi) using any off-the-shelf optimization solvers. Note that the construction of such feature-action
+training pairs needs to be done only once during preprocessing (Fig. 3). Then, we minimize the
+negative log-likelihood (NLL) of all the feature-decision pairs:
+ℓMLE = −E(x,a∗)∼Daq(a∗|x; θ) = E(x,a∗)∼Da
+�
+Ep(y|x;θ)f(y, a∗) + log(Z(x; θ))
+�
+.
+(3)
+By minimizing the NLL, we are essentially minimizing the energy of the optimal actions while
+maximizing the energy of other points. Thus the end-to-end stochastic programming problem is
+translated to learning a neural network that outputs the smallest energy for the optimal actions. This
+new perspective avoids the need of solving and differentiating through the optimization problem at
+every training iteration, but meanwhile tailors the model for the downstream decision making task.
+Our energy-based formulation can also be interpreted as a non-sequential maximum entropy inverse
+reinforcement learning (MaxEN-IRL) model [53, 52]. From the IRL perspective, the input features
+{xi}N
+i=1 can be interpreted as environment states, the feature-decision pairs {(xi, ai)}N
+i=1 as expert
+demonstrations, and the negative expected task loss −Ep(y|x;θ)f(y, a) as reward. Eq. 3 is then
+equivalent to maximizing the likelihood of the expert demonstrations (optimal decisions) to recover
+the hidden reward function.
+3.2
+Augmenting Energy-Based Objective with Distribution Regularizer
+One limitation of learning with EBM-based likelihood for the optimization problem is that we model
+only one data point a∗ for each conditional distribution q(a|x; θ). Minimizing the NLL for a single
+data point ignores the overall matchness between the landscape of original optimization problem and
+that of the EBM-based probability density, which can easily cause overfitting. To learn the overall
+4
+shape of the energy function better, we propose a distribution-based regularizer which augments the
+energy-based objective from a global training perspective.
+The distribution-based regularizer is based on minimizing the distance between the model distribution
+and an oracle posterior distribution. Specifically, we assume that a follows a prior distribution p(a).
+With the ground-truth label y, the posterior distribution of a is then given by p(a|y) = p(a)exp(−f(y,a))
+Z(y)
+when we define the task loss as the negative log-likelihood, i.e.,− log p(y|a) = f(y, a). However,
+such an expression depends on the ground-truth label, which cannot be obtained at test time. We let
+the model distribution q(a|x; θ) mimic this oracle posterior p(a|y) distribution by minimizing their
+KL-divergence:
+ℓKL = E(x,y)∼DKL[p(a|y)||q(a|x; θ)] = E(x,y)∼D
+�
+−Ep(a|y) log q(a|x; θ) − H(p(a|y))
+�
+,
+(4)
+where H(·) denotes entropy of the probability distribution. Our final training loss is a weighted
+combination of the NLL and the distribution based regularizer:
+ℓTotal = ℓMLE + λℓKL,
+(5)
+where λ is a hyper-parameter. In this final objective, the KL-divergence loss and the NLL loss
+complement each other (Fig. 2). The NLL loss is a local training strategy while the KL-divergence
+loss learns the energy function from a global level. Specifically, the NLL loss helps the model capture
+the location of the optimal decision better but ignores the overall energy shape. The distribution-based
+regularizer essentially adds more anchor points besides the optimal decisions and thus helps fit the
+overall energy shape.
+a⇤
+<latexit sha1_base64="u3JZQ+ZV0DN/OBf+
+SLo+VPOejns=">AB7HicbVBNS8NAEJ3Ur1q/qh69LBZBPJSkFvRY8OKxgq2FNpbNdtMu3WzC7
+kQob/BiwdFvPqDvPlv3LY5aOuDgcd7M8zMCxIpDLrut1NYW9/Y3Cpul3Z29/YPyodHbROnmvE
+Wi2WsOwE1XArFWyhQ8k6iOY0CyR+C8c3Mf3ji2ohY3eMk4X5Eh0qEglG0Uos+ZhfTfrniVt05yC
+rxclKBHM1+as3iFkacYVMUmO6npugn1GNgk+LfVSwxPKxnTIu5YqGnHjZ/Njp+TMKgMSxtqWQ
+jJXf09kNDJmEgW2M6I4MsveTPzP6YXvuZUEmKXLHFojCVBGMy+5wMhOYM5cQSyrSwtxI2opoy
++wPn8AZ38joM=</latexit>tPmUbAje8surpF2repfV2l290qjncRThBE7hHDy4gbcQhNawEDAM7zCm6OcF+fd+Vi0Fpx85hj
+a⇤
+<latexit sha1_base64="u3JZQ+ZV0DN/OBf+
+SLo+VPOejns=">AB7HicbVBNS8NAEJ3Ur1q/qh69LBZBPJSkFvRY8OKxgq2FNpbNdtMu3WzC7
+kQob/BiwdFvPqDvPlv3LY5aOuDgcd7M8zMCxIpDLrut1NYW9/Y3Cpul3Z29/YPyodHbROnmvE
+Wi2WsOwE1XArFWyhQ8k6iOY0CyR+C8c3Mf3ji2ohY3eMk4X5Eh0qEglG0Uos+ZhfTfrniVt05yC
+rxclKBHM1+as3iFkacYVMUmO6npugn1GNgk+LfVSwxPKxnTIu5YqGnHjZ/Njp+TMKgMSxtqWQ
+jJXf09kNDJmEgW2M6I4MsveTPzP6YXvuZUEmKXLHFojCVBGMy+5wMhOYM5cQSyrSwtxI2opoy
++wPn8AZ38joM=</latexit>tPmUbAje8surpF2repfV2l290qjncRThBE7hHDy4gbcQhNawEDAM7zCm6OcF+fd+Vi0Fpx85hj
+a⇤
+<latexit sha1_base64="u3JZQ+ZV0DN/OBf+SLo+VPOejns=">AB7HicbVBNS8NAEJ3Ur1q
+/qh69LBZBPJSkFvRY8OKxgq2FNpbNdtMu3WzC7kQob/BiwdFvPqDvPlv3LY5aOuDgcd7M8zMCxIpDLrut1NYW9/Y3Cpul3Z29/YPyodHbROnmvEWi2WsOwE1XArFWyhQ8k6iOY0CyR+C8c3Mf3ji2
+mKXLHFojCVBGMy+5wMhOYM5cQSyrSwtxI2opoytPmUbAje8surpF2repfV2l290qjncRThBE7hHDy4gbcQhNawEDAM7zCm6OcF+fd+Vi0Fpx85hj+wPn8AZ38joM=</latexit>ohY3eMk4X5Eh0qEglG0Uos+ZhfTfrniVt05yCrxclKBHM1+as3iFkacYVMUmO6npugn1GNgk+LfVSwxPKxnTIu5YqGnHjZ/Njp+TMKgMSxtqWQjJXf09kNDJmEgW2M6I4MsveTPzP6YXvuZUE
+a⇤
+<latexit sha1_base64="u3JZQ+ZV0DN/OBf+SLo+VPOejns=">AB7HicbVBNS8NAEJ3Ur1q
+/qh69LBZBPJSkFvRY8OKxgq2FNpbNdtMu3WzC7kQob/BiwdFvPqDvPlv3LY5aOuDgcd7M8zMCxIpDLrut1NYW9/Y3Cpul3Z29/YPyodHbROnmvEWi2WsOwE1XArFWyhQ8k6iOY0CyR+C8c3Mf3ji2
+mKXLHFojCVBGMy+5wMhOYM5cQSyrSwtxI2opoytPmUbAje8surpF2repfV2l290qjncRThBE7hHDy4gbcQhNawEDAM7zCm6OcF+fd+Vi0Fpx85hj+wPn8AZ38joM=</latexit>ohY3eMk4X5Eh0qEglG0Uos+ZhfTfrniVt05yCrxclKBHM1+as3iFkacYVMUmO6npugn1GNgk+LfVSwxPKxnTIu5YqGnHjZ/Njp+TMKgMSxtqWQjJXf09kNDJmEgW2M6I4MsveTPzP6YXvuZUE
+a
+<latexit sha1_base64="/wIa285QnIts1Wal
+WPmoOeuzhI=">AB6XicbVBNS8NAEJ3Ur1q/qh69LBbBU0lqQY8FLx6r2A9oQ9lsN+3SzSbsT
+oRS+g+8eFDEq/Im/GTZuDtj4YeLw3w8y8IJHCoOt+O4WNza3tneJuaW/4PCofHzSNnGqGW+
+xWMa6G1DpVC8hQIl7ya0yiQvBNMbjO/8S1EbF6xGnC/YiOlAgFo2ilB1oalCtu1V2ArBMvJx
+XI0RyUv/rDmKURV8gkNabnuQn6M6pRMnpX5qeELZhI54z1JFI2782eLSObmwypCEsbalkCzU3
+xMzGhkzjQLbGVEcm1UvE/zeimGN/5MqCRFrthyUZhKgjHJ3iZDoTlDObWEMi3srYSNqaYMbThZ
+P9OKM7w=</latexit>CN7qy+ukXat6V9Xafb3SqOdxFOEMzuESPLiGBtxBE1rAIRneIU3Z+K8O/Ox7K14OQzp/AHzuc
+a
+<latexit sha1_base64="/wIa285QnIts1WalWPmoOeuzhI=">AB6XicbVBNS8NAEJ3Ur1q
+/qh69LBbBU0lqQY8FLx6r2A9oQ9lsN+3SzSbsToRS+g+8eFDEq/Im/GTZuDtj4YeLw3w8y8IJHCoOt+O4WNza3tneJuaW/4PCofHzSNnGqGW+xWMa6G1DpVC8hQIl7ya0yiQvBNMbjO/8S1E
+hyUZhKgjHJ3iZDoTlDObWEMi3srYSNqaYMbThZCN7qy+ukXat6V9Xafb3SqOdxFOEMzuESPLiGBtxBE1rAIRneIU3Z+K8O/Ox7K14OQzp/AHzucP9OKM7w=</latexit>bF6xGnC/YiOlAgFo2ilB1oalCtu1V2ArBMvJxXI0RyUv/rDmKURV8gkNabnuQn6M6pRMnpX5qeELZhI54z1JFI2782eLSObmwypCEsbalkCzU3xMzGhkzjQLbGVEcm1UvE/zeimGN/5MqCRFrt
+a
+<latexit sha1_base64="/wIa285QnIts1WalWPmoOeuzhI=">AB6XicbVBNS8NAEJ3Ur1q
+/qh69LBbBU0lqQY8FLx6r2A9oQ9lsN+3SzSbsToRS+g+8eFDEq/Im/GTZuDtj4YeLw3w8y8IJHCoOt+O4WNza3tneJuaW/4PCofHzSNnGqGW+xWMa6G1DpVC8hQIl7ya0yiQvBNMbjO/8S1E
+hyUZhKgjHJ3iZDoTlDObWEMi3srYSNqaYMbThZCN7qy+ukXat6V9Xafb3SqOdxFOEMzuESPLiGBtxBE1rAIRneIU3Z+K8O/Ox7K14OQzp/AHzucP9OKM7w=</latexit>bF6xGnC/YiOlAgFo2ilB1oalCtu1V2ArBMvJxXI0RyUv/rDmKURV8gkNabnuQn6M6pRMnpX5qeELZhI54z1JFI2782eLSObmwypCEsbalkCzU3xMzGhkzjQLbGVEcm1UvE/zeimGN/5MqCRFrt
+a
+<latexit sha1_base64="/wIa285QnIts1WalWPmoOeuzhI=">AB6XicbVBNS8NAEJ3Ur1q
+/qh69LBbBU0lqQY8FLx6r2A9oQ9lsN+3SzSbsToRS+g+8eFDEq/Im/GTZuDtj4YeLw3w8y8IJHCoOt+O4WNza3tneJuaW/4PCofHzSNnGqGW+xWMa6G1DpVC8hQIl7ya0yiQvBNMbjO/8S1E
+bF6xGnC/YiOlAgFo2ilB1oalCtu1V2ArBMvJxXI0RyUv/rDmKURV8gkNabnuQn6M6pRMnpX5qeELZhI54z1JFI2782eLSObmwypCEsbalkCzU3xMzGhkzjQLbGVEcm1UvE/zeimGN/5MqCRFrt
+hyUZhKgjHJ3iZDoTlDObWEMi3srYSNqaYMbThZCN7qy+ukXat6V9Xafb3SqOdxFOEMzuESPLiGBtxBE1rAIRneIU3Z+K8O/Ox7K14OQzp/AHzucP9OKM7w=</latexit>
+E
+<latexit sha1_base6
+4="D0i6AGX3L8a/TeqN943sS+WsuNE=">AB6
+HicbVDLSgNBEOyNrxhfUY9eBoPgKezGgB4DIn
+hMwDwgWcLspDcZMzu7zMwKIeQLvHhQxKuf5M2
+/cZLsQRMLGoqbrq7gkRwbVz328ltbG5t7+R3C
+3v7B4dHxeOTlo5TxbDJYhGrTkA1Ci6xabgR2E
+kU0igQ2A7Gt3O/YRK81g+mEmCfkSHkoecUWOl
+xl2/WHL7gJknXgZKUGer/41RvELI1QGiao1
+l3PTYw/pcpwJnBW6KUaE8rGdIhdSyWNUPvTxa
+EzcmGVAQljZUsaslB/T0xpPUkCmxnRM1Ir3pz
+8T+vm5rwxp9ymaQGJVsuClNBTEzmX5MBV8iMm
+FhCmeL2VsJGVFmbDYFG4K3+vI6aVXK3lW50q
+iWatUsjycwTlcgfXUIN7qEMTGCA8wyu8OY/O
+>i/PufCxbc042cwp/4Hz+AJYFjL8=</latexit
+E
+<latexit sha1_base64="D0i6AGX3L8a/TeqN
+943sS+WsuNE=">AB6HicbVDLSgNBEOyNrxhfUY9eBoPgKezGgB4DInhMwDwgWcLspDcZMzu7z
+MwKIeQLvHhQxKuf5M2/cZLsQRMLGoqbrq7gkRwbVz328ltbG5t7+R3C3v7B4dHxeOTlo5TxbD
+JYhGrTkA1Ci6xabgR2EkU0igQ2A7Gt3O/YRK81g+mEmCfkSHkoecUWOlxl2/WHL7gJknXgZKU
+Ger/41RvELI1QGiao1l3PTYw/pcpwJnBW6KUaE8rGdIhdSyWNUPvTxaEzcmGVAQljZUsaslB/T
+0xpPUkCmxnRM1Ir3pz8T+vm5rwxp9ymaQGJVsuClNBTEzmX5MBV8iMmFhCmeL2VsJGVFmbDYF
++AJYFjL8=</latexit>G4K3+vI6aVXK3lW50qiWatUsjycwTlcgfXUIN7qEMTGCA8wyu8OY/Oi/PufCxbc042cwp/4Hz
+E
+<latexit sha1_base64="D0i6AGX3L8a/TeqN943sS+WsuNE=">AB6HicbVDLSgNBEOyNrxh
+fUY9eBoPgKezGgB4DInhMwDwgWcLspDcZMzu7zMwKIeQLvHhQxKuf5M2/cZLsQRMLGoqbrq7gkRwbVz328ltbG5t7+R3C3v7B4dHxeOTlo5TxbDJYhGrTkA1Ci6xabgR2EkU0igQ2A7Gt3O/YRK8
+suClNBTEzmX5MBV8iMmFhCmeL2VsJGVFmbDYFG4K3+vI6aVXK3lW50qiWatUsjycwTlcgfXUIN7qEMTGCA8wyu8OY/Oi/PufCxbc042cwp/4Hz+AJYFjL8=</latexit>1g+mEmCfkSHkoecUWOlxl2/WHL7gJknXgZKUGer/41RvELI1QGiao1l3PTYw/pcpwJnBW6KUaE8rGdIhdSyWNUPvTxaEzcmGVAQljZUsaslB/T0xpPUkCmxnRM1Ir3pz8T+vm5rwxp9ymaQGJV
+E
+<latexit sha1_base64="D0i6AGX3L8a/TeqN943sS+WsuNE=">AB6HicbVDLSgNBEOyNrxh
+fUY9eBoPgKezGgB4DInhMwDwgWcLspDcZMzu7zMwKIeQLvHhQxKuf5M2/cZLsQRMLGoqbrq7gkRwbVz328ltbG5t7+R3C3v7B4dHxeOTlo5TxbDJYhGrTkA1Ci6xabgR2EkU0igQ2A7Gt3O/YRK8
+suClNBTEzmX5MBV8iMmFhCmeL2VsJGVFmbDYFG4K3+vI6aVXK3lW50qiWatUsjycwTlcgfXUIN7qEMTGCA8wyu8OY/Oi/PufCxbc042cwp/4Hz+AJYFjL8=</latexit>1g+mEmCfkSHkoecUWOlxl2/WHL7gJknXgZKUGer/41RvELI1QGiao1l3PTYw/pcpwJnBW6KUaE8rGdIhdSyWNUPvTxaEzcmGVAQljZUsaslB/T0xpPUkCmxnRM1Ir3pz8T+vm5rwxp9ymaQGJV
+True energy
+MLE training
+KL-divergence training
+MLE+KL-divergence training
+(a)
+(b)
+(c)
+(d)
+Figure 2: Different training objectives of energy-based optimization. (a) the ground-truth energy-
+based landscape; (b) MLE training captures the location of the optimum but ignores the overall energy
+shape; (c) KL-divergence training learns the overall energy shape but captures a blurry optimum
+location; (d) Our MLE+KL-divergence training wins the best of both worlds.
+3.3
+Training with Contrastive Divergence and Self-normalized Importance Sampling
+Optimizing Eq. 5 requires evaluating the partition function and computing the KL-divergence between
+two continuous distributions which typically involves intractable integrals. In this subsection, we
+propose to use a self-normalized importance sampler based on mixture of Gaussians to estimate the
+gradient of the model parameters efficiently. First, we derive (see supplementary for details) the
+gradient of the training loss with respect to the model parameters θ as:
+∂LTotal
+∂θ
+=E(x,a∗)∼Da
+�∂E(a∗, x; θ)
+∂θ
+− Eq(˜a|x;θ)
+∂E(˜a, x; θ)
+∂θ
+�
++ λE(x,y)∼D
+�
+Ep(ˆa|y)
+∂E(ˆa, x; θ)
+∂θ
+− Eq(˜a|x;θ)
+∂E(˜a, x; θ)
+∂θ
+�
+.
+(6)
+As can be seen, the gradient can be estimated by sampling from the model distribution q(a|x; θ) and
+oracle distribution p(a|y). Unfortunately, we cannot easily draw samples because of the unnormalized
+constant. Existing methods usually resort to MCMC methods (e.g., Langevin dynamics) to use this
+gradient estimator. However, MCMC is an iterative process and can be time consuming. To improve
+the training efficiency, we propose to use a self-normalized importance sampler based on a Gaussian
+mixture proposal to estimate the gradient.
+Specifically, for each x, we first sample a set of M candidates {am}M
+m=1 from a proposal distribution
+π(a|x), and then sample ˜a from the empirical distribution located at each am and weighted pro-
+portionally to exp(−E(a|x; θ))/π(a|x). To reduce the variance of the self-normalized importance
+sampler, we propose to use a mixture of K Gaussians which are centered at the location of the corre-
+sponding optimal decision as the proposal distribution: π(a|x) = 1
+K
+�K
+i=1 N(a∗; σk), where K and
+5
+Push down
+Push up
+CD-SNIS 
+Sampler
+a
+<latexit sha1_base64="/wIa285QnIts1WalWPmoOeuzh
+I=">AB6XicbVBNS8NAEJ3Ur1q/qh69LBbBU0lqQY8FLx6r2A9oQ9lsN+3SzSbsToRS+g+8eFDEq/Im/GTZuDtj4YeLw3
+w8y8IJHCoOt+O4WNza3tneJuaW/4PCofHzSNnGqGW+xWMa6G1DpVC8hQIl7ya0yiQvBNMbjO/8S1EbF6xGnC/YiOlAgF
+o2ilB1oalCtu1V2ArBMvJxXI0RyUv/rDmKURV8gkNabnuQn6M6pRMnpX5qeELZhI54z1JFI2782eLSObmwypCEsbalkCzU
+3xMzGhkzjQLbGVEcm1UvE/zeimGN/5MqCRFrthyUZhKgjHJ3iZDoTlDObWEMi3srYSNqaYMbThZCN7qy+ukXat6V9Xafb3
+SqOdxFOEMzuESPLiGBtxBE1rAIRneIU3Z+K8O/Ox7K14OQzp/AHzucP9OKM7w=</latexit>
+a⇤
+<latexit sha1_base64="u3JZQ+ZV0DN/OBf+SLo+VPOejns=">
+AB7HicbVBNS8NAEJ3Ur1q/qh69LBZBPJSkFvRY8OKxgq2FNpbNdtMu3WzC7kQob/BiwdFvPqDvPlv3LY5aOuDgcd7M8zMCxIpDLr
+ut1NYW9/Y3Cpul3Z29/YPyodHbROnmvEWi2WsOwE1XArFWyhQ8k6iOY0CyR+C8c3Mf3ji2ohY3eMk4X5Eh0qEglG0Uos+ZhfTfrniVt
+05yCrxclKBHM1+as3iFkacYVMUmO6npugn1GNgk+LfVSwxPKxnTIu5YqGnHjZ/Njp+TMKgMSxtqWQjJXf09kNDJmEgW2M6I4MsveT
+M7zCm6OcF+fd+Vi0Fpx85hj+wPn8AZ38joM=</latexit>PzP6YXvuZUEmKXLHFojCVBGMy+5wMhOYM5cQSyrSwtxI2opoytPmUbAje8surpF2repfV2l290qjncRThBE7hHDy4gbcQhNawEDA
+a
+<latexit sha1_base64="/wIa285QnIts1WalWPmoOeuzhI=
+">AB6XicbVBNS8NAEJ3Ur1q/qh69LBbBU0lqQY8FLx6r2A9oQ9lsN+3SzSbsToRS+g+8eFDEq/Im/GTZuDtj4YeLw3w8y8
+IJHCoOt+O4WNza3tneJuaW/4PCofHzSNnGqGW+xWMa6G1DpVC8hQIl7ya0yiQvBNMbjO/8S1EbF6xGnC/YiOlAgFo2ilB1
+oalCtu1V2ArBMvJxXI0RyUv/rDmKURV8gkNabnuQn6M6pRMnpX5qeELZhI54z1JFI2782eLSObmwypCEsbalkCzU3xMzGhkz
+jQLbGVEcm1UvE/zeimGN/5MqCRFrthyUZhKgjHJ3iZDoTlDObWEMi3srYSNqaYMbThZCN7qy+ukXat6V9Xafb3SqOdxFOEMzuE
+SPLiGBtxBE1rAIRneIU3Z+K8O/Ox7K14OQzp/AHzucP9OKM7w=</latexit>
+NLL loss
+X KL-divergence loss
++
+(
+)
+Preprocessing 
+E(x, a; ✓) = Ep(y|x;✓)f(y, a)
+<latexit sha1_bas
+e64="FUX270WBgnYnzp10QqLO5RI+WNM=
+">ACKXicbVDLSsNAFJ34rPUVdekmWI
+QKUpJaUBChIAWXFawW2lJuphM7OHkwcyO
+GmN9x46+4UVDUrT/i9CFq9cDA4ZxzmXuP
+Gwmu0LbfjKnpmdm5+dxCfnFpeWXVXFs/
+V2EsKWvQUISy6YJigesgRwFa0aSge8Kd
+uFeHQ/8i2smFQ+DM0wi1vHhMuAep4Ba6p
+rVWrHtA/ZdL73JduGwjX2GsHM0Et20ln
+XTqJjcfoe+IplXTHZhp2sW7JI9hPWXOGN
+SIGPUu+ZTuxfS2GcBUgFKtRw7wk4KEjkV
+LMu3Y8UioFdwyVqaBuAz1UmHl2bWtlZ6
+lhdK/QK0hurPiR8pRLf1cnBwmrSG4j/e
+a0YvYNOyoMoRhbQ0UdeLCwMrUFtVo9LRl
+EkmgCVXO9q0T5IoKjLzesSnMmT/5Lzcs
+nZK5VPK4VqZVxHjmySLVIkDtknVXJC6qR
+BKLkjD+SZvBj3xqPxaryPolPGeGaD/ILx
+8Qk0WKco</latexit>
+Energy Function
+Da = {xi, a⇤
+i }N
+i=1
+<latexit sha1_base64="8r17eR3+7
+2ySFb69LsI0bj7dE34=">ACF3icbVDLSgMxFM3UV62vqks3g0UQkTJTC7op
+FHThSirYB3Ta4U6aUMzD5KMWML8hRt/xY0LRdzqzr8xfSy09UDIyTn3knuPF
+zMqpGV9G5ml5ZXVtex6bmNza3snv7vXEFHCManjiEW85YEgjIakLqlkpBVzAo
+HSNMbXo795j3hgkbhnRzFpBNAP6Q+xSC15OaLTgBygIGpq9SFiqMmb89XD6l
+LT6GrTvTtpK6iFTvt3rj5glW0JjAXiT0jBTRDzc1/Ob0IJwEJWYgRNu2YtlRw
+CXFjKQ5JxEkBjyEPmlrGkJAREdN9krNI630TD/i+oTSnKi/OxQEQowCT1eOpx
+bz3lj8z2sn0r/oKBrGiSQhn7kJ8yUkTkOyexRTrBkI0Ac6pnNfEAOGCpo8z
+pEOz5lRdJo1S0z4ql23KhWp7FkUH6BAdIxudoyq6RjVURxg9omf0it6MJ+PF
+eDc+pqUZY9azj/7A+PwBzGOgQ=</latexit>
+Feature-action pairs
+Optimization
+Solver
+D = {xi, yi}N
+i=1
+<latexit sha1_base64
+="JZ/+wVfZKlCUR28dbQL1KmCYRiI=">ACEXic
+bVDLSsNAFJ34rPUVdekmWIQupCRVsJtCQReupIJ
+9QBPDZDph04ezEzEMOQX3Pgrblwo4tadO/GSd
+qFth4YOHPOvdx7jxdTwoVpfmtLyura+uljfLm1v
+bOr63+VRwhDuoIhGrO9BjikJcUcQXE/ZhgGH
+sU9b3KR+717zDiJwluRxtgJ4CgkPkFQKMnVq3YAx
+RhBKi+zpi2Ln+fLh8wlJ6lL7MyVpGld9euXjFr
+ZgFjkVgzUgEztF39yx5GKAlwKBCFnA8sMxaOhEwQ
+RHFWthOY4gmcIQHioYwNyRxUWZcayUoeFHTL1
+QGIX6u0PCgPM08FRlvjGf93LxP2+QCL/hSBLGic
+Ahmg7yE2qIyMjMYaEYSRoqghEjKhdDTSGDCKhQi
+yrEKz5kxdJt16zTmv1m7NKqzGLowQOwRGoAgucg
+vkDRzad4Q=</latexit>xa4Am3QAQg8gmfwCt60J+1Fe9c+pqVL2qznAPyB9
+Da = {xi, a⇤
+i }N
+i=1
+<latexit sha1_base64="8r17eR3+72
+ySFb69LsI0bj7dE34=">ACF3icbVDLSgMxFM3UV62vqks3g0UQkTJTC7opFHTh
+SirYB3Ta4U6aUMzD5KMWML8hRt/xY0LRdzqzr8xfSy09UDIyTn3knuPFzMqpGV9
+G5ml5ZXVtex6bmNza3snv7vXEFHCManjiEW85YEgjIakLqlkpBVzAoHSNMbXo79
+5j3hgkbhnRzFpBNAP6Q+xSC15OaLTgBygIGpq9SFiqMmb89XD6lLT6GrTvTtpK6i
+FTvt3rj5glW0JjAXiT0jBTRDzc1/Ob0IJwEJWYgRNu2YtlRwCXFjKQ5JxEkBjyE
+PmlrGkJAREdN9krNI630TD/i+oTSnKi/OxQEQowCT1eOpxbz3lj8z2sn0r/oKBrG
+iSQhn7kJ8yUkTkOyexRTrBkI0Ac6pnNfEAOGCpo8zpEOz5lRdJo1S0z4ql23Kh
+Wp7FkUH6BAdIxudoyq6RjVURxg9omf0it6MJ+PFeDc+pqUZY9azj/7A+PwBzGOg
+Q=</latexit>
+Training data
+Feature-action pairs
+Model Training
+Optimization
+Solver
+Test Instance xtest
+<latexit sha1_base64="/G8Aicb1OnYRjWUI6ztZYmnFY=">AC
+AXicbVBNS8NAEN3Ur1q/ol4EL8EieCpJLeix4MVjBfsBbSmb7aRduvlgdyItIV78K148KOLVf+HNf+OmzUFbHw83pthZp4bCa7Qtr+Nwtr6xuZW
+cbu0s7u3f2AeHrVUGEsGTRaKUHZcqkDwAJrIUAnkB9V0DbndxkfvsBpOJhcI+zCPo+HQXc4yilgbmSc+nOHa9ZJoOkh7CFBMEhWk6Mt2xZ7D
+WiVOTsokR2NgfvWGIYt9CJAJqlTXsSPsJ1QiZwLSUi9WEFE2oSPoahpQH1Q/mX+QWudaGVpeKHUFaM3V3xMJ9ZWa+a7uzO5Vy14m/ud1Y/Su+wkP
+ohghYItFXiwsDK0sDmvIJTAUM0ok1zfarExlZShDq2kQ3CWX14lrWrFuaxU72rlei2Po0hOyRm5IA65InVySxqkSRh5JM/klbwZT8aL8W58LFo
+LRj5zTP7A+PwBPTKX/w=</latexit>
+Optimal Action
+Ep(y|x,✓opt)f(y, a)
+<latexit sha1_base64="QomX1cLyZME9ZU9vpbCVyQnitHA=">A
+CH3icbVDLSgNBEJz1GeMr6tHLYhAiSNhVUY+CB4jGCNkwzI76U2GzD6Y6RWXcf/Ei7/ixYMi4s2/cfI4aLRgoKaqm+6uIBVcoeN8WTOzc/ML
+i6Wl8vLK6tp6ZWPzRiWZNBkiUjkbUAVCB5DEzkKuE0l0CgQ0AoG50O/dQdS8S+xjyFTkR7MQ85o2gkv3LsRT7QaAvCl+ntfxh/A/1fbHvY
+R+Q+tpDuEedpFgUe0VYy/fpnl+pOnVnBPsvcSekSiZo+JVPr5uwLIYmaBKtV0nxY6mEjkTUJS9TEFK2YD2oG1oTCNQHT26r7B3jdK1w0SaF
+6M9Un92aBoplUeBqRxur6a9ofif184wPO1oHqcZQszGg8JM2JjYw7DsLpfAUOSGUCa52dVmfSopQxNp2YTgTp/8l9wc1N3D+sHVUfXsaBJHiW
+yTHVIjLjkhZ+SNEiTMPJInskrebOerBfr3foYl85Yk54t8gvW1zcbyaQt</latexit>
+Optimal Energy Function
+λ
+<latexit sha1_base64="fjdCSTk/MJ74hs7LqTc5pZRfows=">AB73icbVDL
+SgMxFL2pr1pfVZdugkVwVWaqYJcFNy4r2Ae0Q8lkMm1oJjMmGaEM/Qk3LhRx6+482/MtLPQ1gOBwznknuPnwiujeN8o9LG5tb2Tnm3srd/cHhUPT7p6jhVlHVoLGLV
+94lmgkvWMdwI1k8UI5EvWM+f3uZ+74kpzWP5YGYJ8yIyljzklBgr9YfCRgNSGVrTt1ZAK8TtyA1KNAeVb+GQUzTiElDBdF64DqJ8TKiDKeCzSvDVLOE0CkZs4GlkRM
+e9li3zm+sEqAw1jZJw1eqL8nMhJpPYt8m4yImehVLxf/8wapCZtexmWSGibp8qMwFdjEOD8eB1wxasTMEkIVt7tiOiGKUGMryktwV09eJ91G3b2qN+6va61mUcZzuAc
+LsGFG2jBHbShAxQEPMrvKFH9ILe0cyWkLFzCn8Afr8AXHmj4s=</latexit>
+D = {xi, yi}N
+i=1
+<latexit sha1_base64="JZ/+wVfZKlCUR28dbQL1
+KmCYRiI=">ACEXicbVDLSsNAFJ34rPUVdekmWIQupCRVsJtCQReupIJ9QBPDZDph04ezEzEMOQX3Pgrb
+lwo4tadO/GSdqFth4YOHPOvdx7jxdTwoVpfmtLyura+uljfLm1vbOr63+VRwhDuoIhGrO9BjikJcUcQ
+QXE/ZhgGHsU9b3KR+717zDiJwluRxtgJ4CgkPkFQKMnVq3YAxRhBKi+zpi2Ln+fLh8wlJ6lL7MyVpGld9e
+uXjFrZgFjkVgzUgEztF39yx5GKAlwKBCFnA8sMxaOhEwQRHFWthOY4gmcIQHioYwNyRxUWZcayUoeFHTL1
+QGIX6u0PCgPM08FRlvjGf93LxP2+QCL/hSBLGicAhmg7yE2qIyMjMYaEYSRoqghEjKhdDTSGDCKhQiyrEK
+Q=</latexit>z5kxdJt16zTmv1m7NKqzGLowQOwRGoAgucgxa4Am3QAQg8gmfwCt60J+1Fe9c+pqVL2qznAPyB9vkDRzad4
+Training data
+a
+<latexit sha1_base64="/wIa285QnIts1WalWPmoOeuzh
+I=">AB6XicbVBNS8NAEJ3Ur1q/qh69LBbBU0lqQY8FLx6r2A9oQ9lsN+3SzSbsToRS+g+8eFDEq/Im/GTZuDtj4YeLw3
+w8y8IJHCoOt+O4WNza3tneJuaW/4PCofHzSNnGqGW+xWMa6G1DpVC8hQIl7ya0yiQvBNMbjO/8S1EbF6xGnC/YiOlAgF
+o2ilB1oalCtu1V2ArBMvJxXI0RyUv/rDmKURV8gkNabnuQn6M6pRMnpX5qeELZhI54z1JFI2782eLSObmwypCEsbalkCzU
+3xMzGhkzjQLbGVEcm1UvE/zeimGN/5MqCRFrthyUZhKgjHJ3iZDoTlDObWEMi3srYSNqaYMbThZCN7qy+ukXat6V9Xafb3
+SqOdxFOEMzuESPLiGBtxBE1rAIRneIU3Z+K8O/Ox7K14OQzp/AHzucP9OKM7w=</latexit>
+E
+<latexit sha1_base64="D0i6AGX3L8
+a/TeqN943sS+WsuNE=">AB6HicbVDLSgNBEOyNrxhfUY9eBoPgKezGgB4DInh
+MwDwgWcLspDcZMzu7zMwKIeQLvHhQxKuf5M2/cZLsQRMLGoqbrq7gkRwbVz328l
+tbG5t7+R3C3v7B4dHxeOTlo5TxbDJYhGrTkA1Ci6xabgR2EkU0igQ2A7Gt3O/Y
+RK81g+mEmCfkSHkoecUWOlxl2/WHL7gJknXgZKUGer/41RvELI1QGiao1l3PT
+Yw/pcpwJnBW6KUaE8rGdIhdSyWNUPvTxaEzcmGVAQljZUsaslB/T0xpPUkCmxnR
+M1Ir3pz8T+vm5rwxp9ymaQGJVsuClNBTEzmX5MBV8iMmFhCmeL2VsJGVFmbDYF
+G4K3+vI6aVXK3lW50qiWatUsjycwTlcgfXUIN7qEMTGCA8wyu8OY/Oi/PufCx
+bc042cwp/4Hz+AJYFjL8=</latexit>
+DNN
+Inference
+r✓
+<latexit sha1_base64="chOpg4yjYi8f9te/oKHQDKEqk0=">AB+HicbVBNS
+8NAEN34WetHox69BIvgqSRVsMeCF48V7Ac0IUy23bpZhN2J0IN/SVePCji1Z/izX/jts1BWx8MPN6bYWZelAqu0XW/rY3Nre2d3dJef/g8KhiH590dJIpyto0EYnqR
+aCZ4JK1kaNgvVQxiCPButHkdu53H5nSPJEPOE1ZEMNI8iGngEYK7YovIRIQ5j6OGcIstKtuzV3AWSdeQaqkQCu0v/xBQrOYSaQCtO57bopBDgo5FWxW9jPNUqATGLG+o
+RJipoN8cfjMuTDKwBkmypREZ6H+nsgh1noaR6YzBhzrVW8u/uf1Mxw2gpzLNEMm6XLRMBMOJs48BWfAFaMopoYAVdzc6tAxKBosiqbELzVl9dJp17zrmr1+tqs1HEUS
+Jn5JxcEo/ckCa5Iy3SJpRk5Jm8kjfryXqx3q2PZeuGVcyckj+wPn8AIyKTXg=</latexit>
+a
+<latexit sha1_base64="/wIa285QnIts1WalWPmoOeuzh
+I=">AB6XicbVBNS8NAEJ3Ur1q/qh69LBbBU0lqQY8FLx6r2A9oQ9lsN+3SzSbsToRS+g+8eFDEq/Im/GTZuDtj4YeLw3
+w8y8IJHCoOt+O4WNza3tneJuaW/4PCofHzSNnGqGW+xWMa6G1DpVC8hQIl7ya0yiQvBNMbjO/8S1EbF6xGnC/YiOlAgF
+o2ilB1oalCtu1V2ArBMvJxXI0RyUv/rDmKURV8gkNabnuQn6M6pRMnpX5qeELZhI54z1JFI2782eLSObmwypCEsbalkCzU
+3xMzGhkzjQLbGVEcm1UvE/zeimGN/5MqCRFrthyUZhKgjHJ3iZDoTlDObWEMi3srYSNqaYMbThZCN7qy+ukXat6V9Xafb3
+SqOdxFOEMzuESPLiGBtxBE1rAIRneIU3Z+K8O/Ox7K14OQzp/AHzucP9OKM7w=</latexit>
+a
+<latexit sha1_base64="/wIa285QnIts1WalWPmoOeuzh
+I=">AB6XicbVBNS8NAEJ3Ur1q/qh69LBbBU0lqQY8FLx6r2A9oQ9lsN+3SzSbsToRS+g+8eFDEq/Im/GTZuDtj4YeLw3
+w8y8IJHCoOt+O4WNza3tneJuaW/4PCofHzSNnGqGW+xWMa6G1DpVC8hQIl7ya0yiQvBNMbjO/8S1EbF6xGnC/YiOlAgF
+o2ilB1oalCtu1V2ArBMvJxXI0RyUv/rDmKURV8gkNabnuQn6M6pRMnpX5qeELZhI54z1JFI2782eLSObmwypCEsbalkCzU
+SqOdxFOEMzuESPLiGBtxBE1rAIRneIU3Z+K8O/Ox7K14OQzp/AHzucP9OKM7w=</latexit>3xMzGhkzjQLbGVEcm1UvE/zeimGN/5MqCRFrthyUZhKgjHJ3iZDoTlDObWEMi3srYSNqaYMbThZCN7qy+ukXat6V9Xafb3
+a⇤
+<latexit sha1_base64="u3JZQ+ZV0DN/OBf+SLo+VPOejns=">
+AB7HicbVBNS8NAEJ3Ur1q/qh69LBZBPJSkFvRY8OKxgq2FNpbNdtMu3WzC7kQob/BiwdFvPqDvPlv3LY5aOuDgcd7M8zMCxIpDLr
+ut1NYW9/Y3Cpul3Z29/YPyodHbROnmvEWi2WsOwE1XArFWyhQ8k6iOY0CyR+C8c3Mf3ji2ohY3eMk4X5Eh0qEglG0Uos+ZhfTfrniVt
+05yCrxclKBHM1+as3iFkacYVMUmO6npugn1GNgk+LfVSwxPKxnTIu5YqGnHjZ/Njp+TMKgMSxtqWQjJXf09kNDJmEgW2M6I4MsveT
+PzP6YXvuZUEmKXLHFojCVBGMy+5wMhOYM5cQSyrSwtxI2opoytPmUbAje8surpF2repfV2l290qjncRThBE7hHDy4gbcQhNawEDA
+M7zCm6OcF+fd+Vi0Fpx85hj+wPn8AZ38joM=</latexit>
+E
+<latexit sha1_base64="D0i6AGX3L8a/TeqN943sS+WsuNE=">AB6HicbVDL
+SgNBEOyNrxhfUY9eBoPgKezGgB4DInhMwDwgWcLspDcZMzu7zMwKIeQLvHhQxKuf5M2/cZLsQRMLGoqbrq7gkRwbVz328ltbG5t7+R3C3v7B4dHxeOTlo5TxbDJYh
+GrTkA1Ci6xabgR2EkU0igQ2A7Gt3O/YRK81g+mEmCfkSHkoecUWOlxl2/WHL7gJknXgZKUGer/41RvELI1QGiao1l3PTYw/pcpwJnBW6KUaE8rGdIhdSyWNUPvTx
+gfXUIN7qEMTGCA8wyu8OY/Oi/PufCxbc042cwp/4Hz+AJYFjL8=</latexit>aEzcmGVAQljZUsaslB/T0xpPUkCmxnRM1Ir3pz8T+vm5rwxp9ymaQGJVsuClNBTEzmX5MBV8iMmFhCmeL2VsJGVFmbDYFG4K3+vI6aVXK3lW50qiWatUsjycwTlc
+E
+<latexit sha1_base64="D0i6AGX3L8a/TeqN943sS+WsuNE=">AB6HicbVDL
+SgNBEOyNrxhfUY9eBoPgKezGgB4DInhMwDwgWcLspDcZMzu7zMwKIeQLvHhQxKuf5M2/cZLsQRMLGoqbrq7gkRwbVz328ltbG5t7+R3C3v7B4dHxeOTlo5TxbDJYh
+GrTkA1Ci6xabgR2EkU0igQ2A7Gt3O/YRK81g+mEmCfkSHkoecUWOlxl2/WHL7gJknXgZKUGer/41RvELI1QGiao1l3PTYw/pcpwJnBW6KUaE8rGdIhdSyWNUPvTx
+aEzcmGVAQljZUsaslB/T0xpPUkCmxnRM1Ir3pz8T+vm5rwxp9ymaQGJVsuClNBTEzmX5MBV8iMmFhCmeL2VsJGVFmbDYFG4K3+vI6aVXK3lW50qiWatUsjycwTlc
+gfXUIN7qEMTGCA8wyu8OY/Oi/PufCxbc042cwp/4Hz+AJYFjL8=</latexit>
+E
+<latexit sha1_base64="D0i6AGX3L8a/TeqN943sS+WsuNE=">AB6HicbVDL
+SgNBEOyNrxhfUY9eBoPgKezGgB4DInhMwDwgWcLspDcZMzu7zMwKIeQLvHhQxKuf5M2/cZLsQRMLGoqbrq7gkRwbVz328ltbG5t7+R3C3v7B4dHxeOTlo5TxbDJYh
+GrTkA1Ci6xabgR2EkU0igQ2A7Gt3O/YRK81g+mEmCfkSHkoecUWOlxl2/WHL7gJknXgZKUGer/41RvELI1QGiao1l3PTYw/pcpwJnBW6KUaE8rGdIhdSyWNUPvTx
+aEzcmGVAQljZUsaslB/T0xpPUkCmxnRM1Ir3pz8T+vm5rwxp9ymaQGJVsuClNBTEzmX5MBV8iMmFhCmeL2VsJGVFmbDYFG4K3+vI6aVXK3lW50qiWatUsjycwTlc
+gfXUIN7qEMTGCA8wyu8OY/Oi/PufCxbc042cwp/4Hz+AJYFjL8=</latexit>
+E
+<latexit sha1_base64="D0i6AGX3L8a/TeqN943sS+WsuNE=">AB6HicbVDL
+SgNBEOyNrxhfUY9eBoPgKezGgB4DInhMwDwgWcLspDcZMzu7zMwKIeQLvHhQxKuf5M2/cZLsQRMLGoqbrq7gkRwbVz328ltbG5t7+R3C3v7B4dHxeOTlo5TxbDJYh
+GrTkA1Ci6xabgR2EkU0igQ2A7Gt3O/YRK81g+mEmCfkSHkoecUWOlxl2/WHL7gJknXgZKUGer/41RvELI1QGiao1l3PTYw/pcpwJnBW6KUaE8rGdIhdSyWNUPvTx
+aEzcmGVAQljZUsaslB/T0xpPUkCmxnRM1Ir3pz8T+vm5rwxp9ymaQGJVsuClNBTEzmX5MBV8iMmFhCmeL2VsJGVFmbDYFG4K3+vI6aVXK3lW50qiWatUsjycwTlc
+gfXUIN7qEMTGCA8wyu8OY/Oi/PufCxbc042cwp/4Hz+AJYFjL8=</latexit>
+a⇤
+test
+<latexit sha1_base64="e3JkY4Ideut7GJ0XABSBPk0aoyk=">AB9XicbVDLSgNB
+EJz1GeMr6tHLYBDEQ9iNAT0GvHiMYB6QbMLspJMmZ1dZnqVsOQ/vHhQxKv/4s2/cZLsQRMLGoqbrq7glgKg67aytb2xubed28rt7+weHhaPjhokSzaHOIxnpVsAMSKGgjgI
+ltGINLAwkNIPx7cxvPoI2IlIPOInBD9lQiYHgDK3UZb20o0OKYHDavewVim7JnYOuEi8jRZKh1it8dfoRT0JQyCUzpu25Mfop0yi4hGm+kxiIGR+zIbQtVSwE46fzq6f03Cp9Oo
+i0LYV0rv6eSFlozCQMbGfIcGSWvZn4n9dOcHDjp0LFCYLi0WDRFKM6CwC2hcaOMqJYxrYW+lfMQ042iDytsQvOWXV0mjXPKuSuX7SrFayeLIkVNyRi6IR65JldyRGqkTjR5
+Jq/kzXlyXpx352PRuZkMyfkD5zPH0/gklc=</latexit>
+Figure 3: Illustration of SO-EBM: end-to-end stochastic optimization with energy-based model.
+{σk}K
+k=1 are hyper-parameters. This mixture of Gaussian based self-normalized importance sampler
+enjoys great computational efficiency. We only need to estimate the gradient of the energy-based
+surrogate layer by drawing samples from a simple mixture of Gaussians, instead of solving and
+differentiating through the optimization problem as in DFL. This significantly reduces the training
+time compared with DFL as shown in Section 4. Further, locating the proposal distribution at the
+optimal decisions mimics the contrastive divergence method [22, 15] used in Langevin dynamics
+where the MCMC chain starts from the training data. This makes the proposal distribution close to
+the model distribution and thus has better sample efficiency. The sampling procedure from the oracle
+distribution p(a|y) is similar with q(a|x; θ).
+When the expected task loss has no analytical expression, we can draw multiple samples from
+p(y|x; θ) to estimate the expectation and use reparameterization trick [29, 23, 36, 42] to make it
+differentiable. Finally, the model can be efficiently trained via gradient-based method, such as Adam
+[28]. The detailed training procedure is given in Alg. 1 in the supplementary.
+Model inference. With the optimal model parameter θopt, we draw samples from q(a|xtest; θopt) for
+an unseen test instance xtest. However, in the real-world applications, we usually only need the
+most optimal decision. This can be obtained by solving arg mina∗
+test∈C Ep(y|xtest;θopt)f(y, a) with
+any existing black-box optimization solver such as CVXPY [12, 2] and Pyomo [5, 21] (Fig. 3).
+4
+Experiments
+In this section, we empirically evaluate SO-EBM. We conduct experiments in three applications: (1)
+Load forecasting and generator scheduling where the expected task loss has a closed-form expression;
+(2) Resource allocation for COVID-19 where the expected task loss has no closed-form expression;
+(3) Adversarial behavior learning in network security with a non-convex optimization objective.
+Finally, we do ablation studies to show the effect of each component in SO-EBM.
+4.1
+Load Forecasting and Generator Scheduling
+In this task, a power system operator needs to decide how much electricity a ∈ R24 to schedule for
+each hour in the next 24 hours to meet the actual electricity demands. The optimization objective is a
+combination of an under-generation penalty, an over-generation penalty, and a mean squared loss
+between supplies and demands:
+minimizea∈R24
+24
+�
+i=1
+Ey∼p(y|x;θ)[γs[yi − ai]+ + γe[ai − yi]+ + 1
+2(ai − yi)2]
+subject to
+|ai − ai−1| ≤ cr
+∀i,
+(7)
+6
+1.5
+1.0
+0.5
+0.0
+0.5
+1.0
+1.5
+d1
+1.5
+1.0
+0.5
+0.0
+0.5
+1.0
+1.5
+d2
+True landscape
+1.5
+1.0
+0.5
+0.0
+0.5
+1.0
+1.5
+d1
+Recovered landscape
+1.5
+1.0
+0.5
+0.0
+0.5
+1.0
+1.5
+d1
+True landscape
+1.5
+1.0
+0.5
+0.0
+0.5
+1.0
+1.5
+d1
+Recovered landscape
+Figure 4: Ground-truth and SO-EBM recovered landscapes of the energy function in the power
+generator scheduling task. Darker colors represent lower energy in the heat maps. For a test sample
+xtest, we choose the corresponding optimal action a∗
+test as the center point and select two random
+direction vectors v1 and v2 to plot the energy landscape, i.e.,E
+′(d1, d2) = E(x, a∗ + d1v1 + d2v2).
+where [·]+ = max{v, 0}. Usually, the penalty coefficients satisfy γe ≫ γs since under-generation is
+more serious than over-generation. The quadratic regularization term indicates the preference for
+generation schedules that closely match actual demands. The ramping constraint cr restricts the
+change in generation between consecutive timepoints, which reflects physical limitations associated
+with quick changes in electricity output levels.
+Experiment Setup. We forecast the electricity demands y ∈ R24 over all 24 hours of the next day
+using a 2-hidden layer neural network. We assume yi is a Gaussian with mean µi and variance σ2
+i ; as
+such, the expectation in the optimization objective can be computed analytically. The input features
+x is a 150-dimensional vector including the past day’s electrical load and temperature, the next day’s
+temperature forecast, non-linear functions of the temperatures, binary indicators of weekends or
+holidays, and yearly sinusoidal features. Following [13], we set γs = 0.4, γe = 50 and c = 0.4.
+We compare with the following baselines on this task: (1) A two-stage predict-then-optimize model
+trained with negative likelihood loss for the prediction task. (2) Decision-focused learning with the
+QPTH solver [13]. It uses sequential quadratic programming (SQP) to iteratively approximate the
+resultant convex objective as a quadratic objective, iterates until convergence, and then computes the
+necessary Jacobians using the quadratic approximation at the solution. (3) DFL with cvxpylayers
+[1] (DFL-CVX) which provides a differentiable layer with disciplined parameterized programming
+(DPP) grammar. Since the analytical expectation of Eq. 7 cannot be written in DPP, we use Monte
+Carlo sampling to estimate the expectation for this baseline. (4) Policy-net. It direct maps from the
+input features to the decision variables by minimizing the task loss using supervised learning [13].
+Our supplementary provides more details of the model parameters.
+Two-Stage
+Policy Net
+DFL-QPTH
+DFL-CVX
+SO-EBM
+0
+2
+4
+6
+Task Loss
+Two-Stage
+Policy Net
+DFL-QPTH
+DFL-CVX
+SO-EBM
+10
+1
+101
+103
+Training Time (seconds/epoch)
+Figure 5: Results on power generator scheduling.
+Results. Fig. 5 shows the end task loss for all the
+methods. Our method SO-EBM outperforms all
+the baselines with a significant reduction of train-
+ing time. Compared with the strongest baseline
+DFL-QPTH, SO-EBM improves the task loss by
+7.3%. The improvement is because DFL-QPTH
+needs to use SQP to iteratively obtain the solu-
+tions for non-quadratic optimization problems.
+Differentiating through all the steps of SQP is
+prohibitively expensive in memory and time. To
+address this issue, existing works [13] differen-
+tiate through just the last step of SQP to obtain
+approximate gradients. The inaccurate gradients
+may accrue during training and thus hurt decision quality. This shows that our explicit differentiable
+energy-based function is an effective surrogate for the original implicit optimization layer. In term of
+efficiency, SO-EBM is more than 136 times faster than DFL-QPTH (0.68 second/epoch v.s. 93.12
+second/epoch) in training. This is because we only need to draw samples from a simple mixture
+of Gaussians to estimate the model parameters instead of solving and differentiating through the
+optimization problem at every training iteration. DFL-CVX is even slower than DFL-QPTH since it
+needs to use sample average estimation to draw multiple samples from p(y|x; θ), which results in a
+much more complicated optimization objective. This is also likely the reason why DFL-CVX under-
+performs DFL-QPTH in terms of task loss here. For Policy-Net, we have tuned its hyper-parameters
+extensively but still cannot achieve good performance on this task (2x-3x larger task loss than the
+two-stage baseline). This is not surprising: as aforementioned, Policy-Net is a pure end-to-end model
+7
+that needs a large amount of data to rediscover the algorithmic structure of the optimization task. In
+contrast, DFL and SO-EBM model the predict-and-optimize structure in the model design, which
+save learning and are more data-efficient.
+Fig. 4 shows the ground-truth and SO-EBM learned landscapes of the energy function. As we can
+see, SO-EBM can recover the landscape of the original optimization objective effectively though with
+a small discrepancy. The small discrepancy is expected since the ground-truth landscape is computed
+by directly using the ground-truth label, while SO-EBM uses the uncertainty-aware neural network
+to first forecast the distribution of the label and then uses the predictive distribution to compute the
+expected task loss as the energy function.
+4.2
+Resource Allocation for COVID-19
+As seen in the COVID-19 pandemic, an increasing number of infected patients leads to increasing
+demand for medical resources; which makes it challenging for policymakers and epidemiologists to
+plan ahead. Mechanistic epidemiological models based on Ordinary Differential Equations (ODEs)
+are often used to capture and forecast the dynamics of epidemics including for the COVID-19
+pandemic [35, 24, 20, 10]. Such forecasts are typically then used as guidance to help plan for future
+resource allocation [38, 18, 43, 25]. In this task, we study the optimization problem of hospital bed
+preparation for COVID-19, one of the most common and important tasks epidemiologists focus on
+during the pandemic [3, 7]. We need to decide how many beds a ∈ R7 are needed to prepare for
+the next week based on the forecasted number of hospitalized patients y ∈ R7. The optimization
+objective is a combination of linear and quadratic costs, which accounts for over-preparations [a−y]+
+and under-preparations [y − a]+ in the next 7 days over ODE-derived dynamics:
+minimizea∈R7
+7
+�
+i=1
+cb[yi − ai]+ + ch[ai − yi]+ + qb([yi − ai])2
++ + qh([ai − yi])2
++.
+(8)
+Experiment Setup. We use the SEIR+HD ODE model proposed in [24] to capture the dynamics
+of the COVID-19 pandemic, which has been used in policy studies for interventions. The model is
+driven by a key parameter: the transmission rate β that reflects the probability of disease transmission.
+The forecasting model is a two-layer gated recurrent unit (GRU) [6] which takes the number of people
+in each state of the SEIR+HD model in the last 21 days as input features and outputs the transmission
+rate β for the next 7 days. We assume that β follows a Gaussian distribution. Since SEIR-HD is a
+complex non-linear ODE system, there is no closed expression for the distribution of the number
+of hospitalized patients y. Hence, we choose to sample from the forecasted distribution of β 100
+times and then simulate the SEIR-HD model to obtain the empirical distribution of the number of
+hospitalized patients y.
+Two-Stage
+DFL-CVX
+SO-EBM
+0
+2000
+4000
+6000
+8000
+10000
+Task Loss
+Two-Stage
+DFL-CVX
+SO-EBM
+0
+100
+200
+300
+400
+Training Time (seconds/epoch)
+Figure 6: Results on Covid-19 resource allocation.
+Results. Fig. 6 shows the results on the resource
+allocation for COVID-19 task. Both SO-EBM
+and DFL significantly outperforms the two-stage
+model in terms of the task loss, yielding 10.9%+
+improvement. DFL-QPTH is not included here
+because it needs to use SQP to iteratively ap-
+proximate the objective and is much slower than
+DFL-CVX in this task. The performance of SO-
+EBM and DFL are similar, however, the training
+time of SO-EBM is 4.3 times faster than DFL.
+The time improvement of SO-EBM is not as
+large as on the energy scheduling task because
+all the methods need to compute the complex
+ODE equations in the forward pass which is a time consuming part. Therefore, considering the
+overall training efficiency, we argue that SO-EBM is a better option than DFL on this task in practice.
+4.3
+Network Security Game
+In this task, we study stochastic optimization in network security games [49]. Given a network
+G = (V, E), a source node s ∈ V , and a set of target nodes T ∈ V , a network security game
+(NSG) [50, 17, 44] defines the min-max game where the attacker attempts to travel from s to any
+t ∈ T while the defender places checkpoints on certain number of edges in the graph. Each of the
+8
+target node has a reward u(t) should the attacker reach them. The defender first chooses a mixed
+strategy. Having observed the defender’s mixed strategy but not the sampled pure strategy, the
+attacker attempts to choose a path. To minimize the attacker’s scores, the defender can try to predict
+the attacker’s path decisions with node features and their past decisions, since the attacker is not
+perfectly rational in reality. Suppose that a defines the placement of checkpoints by the defender
+where ae is the probability that edge e is covered. The attackers will perform a random walk on the
+graph, generating a path r, stopping at either a target or a checkpoint. The transition between two
+nodes is determined by the defender’s strategy a and node-level parameters y, where yu defines the
+“attractiveness” of node u, representing the attacker’s idiosyncratic preferences. The defender wants to
+choose a to maximize its expected utility: maxa ET ∼aEr∼p(r|a,y) − g(r), where T is covered edges
+sampled according to a, g(r) = u(t) if the attacker reaches target t with path r and 0 if the attacker is
+stopped at a checkpoint. The defender’s objective comes with the constraint � a ≤ k, where k = 3
+represents the resources available to the defender. The optimization objective is non-convex due to
+the irrational strategy of the attacker [48].
+Setup. We follow the setup of [49], see supplementary for details.
+Two-Stage
+DFL-Block
+Surrogate
+SO-EBM
+0.0
+0.2
+0.4
+0.6
+0.8
+Task Loss
+Two-Stage
+DFL-Block
+Surrogate
+SO-EBM
+0
+100
+200
+300
+400
+Training Time (seconds/epoch)
+Figure 7: Results on network security game.
+Results. Fig. 7 shows the results on the adver-
+sarial network security game task. Since the
+original DFL fails on this large scale problem,
+we compare a block-variable sampling approach
+specialized to this task (DFL-Block)[48]. Surro-
+gate [49] performs a linear dimension reduction
+for DFL to speed up the training time and im-
+prove the performance by smoothing the train-
+ing landscape. We did not present the results
+of Surrogate in the previous two tasks because
+the numbers of decision variables there are rel-
+atively small and it has even worse performance
+than the original DFL approach. As we can see,
+SO-EBM can achieve competitive task loss with Surrogate and outperforms DFL-block and the
+two-stage method. The increase of training time in our method is mainly because every evaluation
+of the defender’s utility requires a matrix inverse; our method needs to evaluate the utility for all
+the samples drawn from the proposal distribution which results a larger matrix to inverse. However,
+this issue can be mitigated by using some advanced matrix inverse algorithm [9, 32]. DFL-Block is
+even worse than the two-stage model because it back-propagates through randomly sampled variables
+which results in inaccruate gradient estimation.
+4.4
+Ablation Study
+Method
+Task loss
+Two-stage
+4.52 ± 0.33
+SO-EBM w/o MLE
+4.31 ± 0.17
+SO-EBM w/o KLD
+3.89 ± 0.18
+SO-EBM w/ CD-LD
+3.85 ± 0.13
+SO-EBM
+3.83 ± 0.15
+Table 1:
+Ablation study on power generator
+scheduling.
+We investigate the effectiveness of the coupled
+training objective and alternative EBM training
+algorithms via ablation studies on the load fore-
+casting and generator scheduling task. Table 1
+shows the results. Our findings can be summa-
+rized as follows: (1) Both the MLE and KLD
+training objectives work and outperform the two-
+stage model. This verifies the effectiveness of
+using the energy-based surrogate function to ap-
+proximate the optimization landscape. (2) By
+dropping either the MLE or KLD term, we observe a performance degradation in our method. Specif-
+ically, without the MLE term, the task loss increases by 13%; without KLD term, the task loss
+increases by 2%. The larger degradation when simply minimizing the KLD term is possibly because
+accurately recover the entire optimization landscape is too difficult and it needs the MLE term to help
+capture the location of the optimal decision. (3) Training SO-EBM with Contrastive Divergence based
+Langevin Dynamics (CD-LD) [15] achieves similar performance but incurs longer training time (1.47
+second/epoch v.s. 0.68 second/epoch). This phenomenon is likely because the optimization problem
+is relatively low-dimensional, thus importance sampling works well and enjoys better efficiency in
+this regime. However, even with CD-LD, SO-EBM is still 63 times faster than DFL-QPTH (1.47
+second/epoch v.s. 93.12 second/epoch).
+9
+0.25
+0.50
+0.75
+1.00
+Ratio of training data
+4.0
+4.5
+5.0
+5.5
+6.0
+Task Loss
+Two-stage
+DFL-QPTH
+SO-EBM
+0.25
+0.50
+0.75
+1.00
+Ratio of training data
+10
+2
+10
+1
+100
+101
+102
+Training Time (seconds/epoch)
+Figure 8: Task losses and training time under dif-
+ferent ratios of training data on power generator
+scheduling.
+We also investigate the impact of training data
+size for each method. Fig. 8 provides the task
+losses and training time under different ratios of
+training data on the load forecasting and genera-
+tor scheduling task. As we can see, our method
+outperforms the baselines constantly except for
+the ratio of 0.05. When the ratio is below 0.05,
+all the methods cannot work properly due to the
+extremely low resource. The superior perfor-
+mance of our method is because we design the
+energy function as the expected task loss, which
+leverages the algorithmic structure inherent in
+the optimization problem. Hence, our method
+is not very data demanding. In terms of effi-
+ciency, our method reduces the training time
+significantly compared with DFL-QPTH across different amounts of training data.
+5
+Additional Related Work
+The DFL works described in Section 2 focus on continuous optimization. There are also studies that
+extend DFL for combinatorial optimization. [51] relaxes the discrete decision into its continuous
+counterpart and adds a quadratic regularization term to avoid vanishing gradients. [37] proposes
+a log barrier regularizer and differentiates through the homogeneous self-dual embedding. [39]
+proposes a noise contrastive objective by maximizing the distance between the optimal solution and
+noisy samples. Our framework may be also extended for combinatorial problems by using discrete
+energy-based model [11]. The SPO+ loss [16] has been proposed to measure the prediction errors
+against optimization objectives, but it is only applicable to linear programming. ProjectNet [8]
+approximately solves the linear programming problems using a differentiable projection architecture.
+Our work is also related to learning to optimize [47, 34, 26], which learns a policy network that solves
+optimization problems using supervised or reinforcement learning. However, these pure approaches
+need to rediscover the structure of the optimization problem and thus data-inefficient.
+6
+Limitations and Discussion
+We focused on addressing the scalability and generality of existing decision-focused learning (DFL)
+for end-to-end stochastic optimization. We argue that these deficiencies stem from the reliance of
+implicitly differentiable optimization layers based on KKT conditions. As a remedy, we circumvent
+such deficiencies by replacing the implicit optimization layer with a newly parameterized energy-
+based surrogate function. We proposed a coupled training objective to encourage the energy-based
+surrogate well approximate the optimization landscape, as well as an efficient training procedure based
+on self-normalized importance sampling. Empirically, we demonstrated that our energy-based model
+is effective in a wide range of stochastic optimization problems with either convex or nonconvex
+objectives. It can achieve better or comparable performance than state-of-the-art DFL methods for
+stochastic optimization, while being several times or even orders of magnitude faster.
+We discuss limitations and possible extensions of SO-EBM: (1) Handling more complex constraints.
+Our method handles the constraints implicitly through the pre-processing step and explicitly through
+the inference step. However, when the feasible space is extremely small, training the constrained EBM
+may have more benefits. To train EBMs in the constrained space, one direction is to project samples
+into the feasibility space. Another direction is to explore adding soft constraints to the energy function
+during training, e.g., Augmented Lagrangian penalty and Barrier penalty. (2) More effective training
+methods. Our method is a general framework for end-to-end stochastic programming problem based
+on EBM. There are a number of training techniques [45] that can be plugged into our framework and
+we can further improve the task performance using the advanced EBM training algorithms [14, 40].
+Acknowledgments: We thank the anonymous reviewers for their helpful comments. This work
+was supported in part by the NSF (Expeditions CCF-1918770, CAREER IIS-2028586, IIS-2027862,
+IIS-1955883, IIS-2106961, IIS-2008334, CAREER IIS-2144338, PIPP CCF-2200269), CDC MInD
+program, faculty research award from Facebook and funds/computing resources from Georgia Tech.
+10
